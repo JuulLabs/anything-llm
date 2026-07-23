@@ -3,7 +3,7 @@ import * as path from 'path';
 import { spawnSync, spawn } from 'child_process';
 import {
   PLATFORM, GUEST_ARCH, CPUS, RAM, SERVICE_DIR,
-  LOCKDOWN_PROXY_GUEST_IP, LOCKDOWN_LLM_GUEST_IP, LOCKDOWN_PROXY_PORT,
+  LOCKDOWN_PROXY_GUEST_IP, LOCKDOWN_LLM_GUEST_IP, LOCKDOWN_MCP_GUEST_IP, LOCKDOWN_PROXY_PORT,
   resolveQemuBinary, resolveQemuImgBinary, resolveEfiCode, resolveEfiVars,
   type Platform,
 } from './config.js';
@@ -69,6 +69,11 @@ interface QemuArgsOptions {
   unrestricted?: boolean;
   /** Host-side LLM port exposed to the guest via the 10.0.2.101 pinhole. */
   llmPort?: number;
+  /**
+   * Host-side MCP relay port exposed to the guest via the 10.0.2.102 pinhole.
+   * Opt-in: unlike llmPort, this pinhole is only opened when set.
+   */
+  mcpPort?: number;
   /** Host-side whitelist proxy port (default 3128), pinholed at 10.0.2.100. */
   proxyPort?: number;
   /** Host path of the per-agent read-write workspace share. */
@@ -86,11 +91,12 @@ export interface NetdevOptions {
   appPort?: number;
   unrestricted?: boolean;
   llmPort?: number;
+  mcpPort?: number;
   proxyPort?: number;
 }
 
 export function buildNetdevString(opts: NetdevOptions): string {
-  const { sshPort, appPort, unrestricted, llmPort, proxyPort = LOCKDOWN_PROXY_PORT } = opts;
+  const { sshPort, appPort, unrestricted, llmPort, mcpPort, proxyPort = LOCKDOWN_PROXY_PORT } = opts;
   let netdev = `user,id=net0,hostfwd=tcp:127.0.0.1:${sshPort}-:22`;
   if (appPort !== undefined) {
     netdev += `,hostfwd=tcp:127.0.0.1:${appPort}-:18790`;
@@ -104,6 +110,11 @@ export function buildNetdevString(opts: NetdevOptions): string {
     netdev += `,guestfwd=tcp:${LOCKDOWN_PROXY_GUEST_IP}:${proxyPort}-cmd:nc 127.0.0.1 ${proxyPort}`;
     if (llmPort !== undefined) {
       netdev += `,guestfwd=tcp:${LOCKDOWN_LLM_GUEST_IP}:${llmPort}-cmd:nc 127.0.0.1 ${llmPort}`;
+    }
+    // MCP pinhole is opt-in: only opened when a port is actually configured,
+    // unlike the always-on LLM pinhole above.
+    if (mcpPort !== undefined) {
+      netdev += `,guestfwd=tcp:${LOCKDOWN_MCP_GUEST_IP}:${mcpPort}-cmd:nc 127.0.0.1 ${mcpPort}`;
     }
   }
   return netdev;
@@ -162,7 +173,7 @@ export function isoDeviceArgs(iso: string | undefined, platform: Platform = PLAT
 export function buildQemuArgs(opts: QemuArgsOptions): string[] {
   const {
     disk, efi, sshPort, pidFile, monitorSock, appPort, dev, vncDisplay = 1, iso,
-    unrestricted, llmPort, proxyPort, workspace, ram,
+    unrestricted, llmPort, mcpPort, proxyPort, workspace, ram,
   } = opts;
   const efiCode = resolveEfiCode();
 
@@ -174,7 +185,7 @@ export function buildQemuArgs(opts: QemuArgsOptions): string[] {
     fs.copyFileSync(PLATFORM === 'win32' ? resolveEfiVars() : efiCode, efi);
   }
 
-  const netdev = buildNetdevString({ sshPort, appPort, unrestricted, llmPort, proxyPort });
+  const netdev = buildNetdevString({ sshPort, appPort, unrestricted, llmPort, mcpPort, proxyPort });
 
   const args: string[] = [
     ...buildMachineArgs(),

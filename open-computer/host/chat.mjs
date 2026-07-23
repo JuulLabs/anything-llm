@@ -485,11 +485,19 @@ async function handleSlash(cmd) {
   /status       Show agent status
   /usage        Show token usage
   /deliverables List saved deliverables
+  /steer <msg>  Inject a message into the currently-running turn
   /quit         Exit
   /help         Show this help`);
         break;
       case "abort":
         safeLog(await api(baseUrl, "POST", "/api/v1/abort"));
+        break;
+      case "steer":
+        if (!arg) {
+          safeLog(`${RED}Usage: /steer <message>${RESET}`);
+          break;
+        }
+        await sendSteer(arg);
         break;
       case "new":
         safeLog(await api(baseUrl, "POST", "/api/v1/new-session"));
@@ -538,6 +546,23 @@ async function sendPrompt(text) {
       safeError(`${RED}Cannot reach ${baseUrl} — is the agent running?${RESET}`);
     } else {
       safeError(`${RED}Prompt failed: ${err.message}${RESET}`);
+    }
+  }
+}
+
+async function sendSteer(text) {
+  sentPrompts.add(text);
+  try {
+    const res = await api(baseUrl, "POST", "/api/v1/prompt", { prompt: text, mode: "steer" });
+    if (res.status && res.status !== "steer_sent") {
+      safeLog(`${DIM}[${res.status}]${RESET}`);
+    }
+  } catch (err) {
+    sentPrompts.delete(text);
+    if (err.cause?.code === "ECONNREFUSED" || err.message.includes("fetch failed")) {
+      safeError(`${RED}Cannot reach ${baseUrl} — is the agent running?${RESET}`);
+    } else {
+      safeError(`${RED}Steer failed: ${err.message}${RESET}`);
     }
   }
 }

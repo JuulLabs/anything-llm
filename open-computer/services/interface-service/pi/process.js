@@ -114,6 +114,22 @@ function sendRpcPrompt(prompt) {
   console.log(`[pi] RPC prompt sent: ${prompt}`);
 }
 
+// Injects a message into an already-running turn via the "steer" RPC command.
+// Unlike sendRpcPrompt (followUp), this is delivered after the current tool
+// call finishes but before the next LLM call — a fast interjection that
+// doesn't wait for the agent to go fully idle.
+function sendRpcSteer(message) {
+  if (!workspace.piRpc) return;
+  workspace.piRpc.write(
+    JSON.stringify({
+      id: `steer-${Date.now()}`,
+      type: "steer",
+      message,
+    }) + "\n",
+  );
+  console.log(`[pi] RPC steer sent: ${message}`);
+}
+
 // ─── Models configuration ──────────────────────────────────────────────────
 // Writes ~/.pi/agent/models.json so the pi agent uses our LLM proxy instead
 // of the real provider directly.  This lets us optimize context before forwarding.
@@ -312,6 +328,7 @@ module.exports = {
   cleanupDesktop,
   writeTrace,
   sendRpcPrompt,
+  sendRpcSteer,
   writeModelsJson,
   buildPiArgs,
   launchPiProcess,

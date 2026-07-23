@@ -5,7 +5,8 @@ import { Command } from 'commander';
 import { PLATFORM, GUEST_ARCH, VM_USER, SETUP_DIR, SERVICE_DIR, BASE_DISK } from '../config.js';
 import {
   agentExists, readAgentJson, agentEnvPath, agentDir,
-  pidfilePath, monitorSockPath, efiVarsPath,
+  pidfilePath, monitorSockPath, efiVarsPath, relayPidfilePath, mcpRelayPidfilePath,
+  type AgentJson,
 } from '../registry.js';
 import {
   isRunning, readPid, killPid, startVm, waitForShutdown,
@@ -54,10 +55,41 @@ function syncServiceToVm(sshPort: number): void {
 }
 
 /**
- * Extract the LLM port from the agent's OPENAI_BASE_URL (agents/<name>/.env)
- * to open the 10.0.2.101 guestfwd pinhole to it. Only local
- * (localhost/127.0.0.1) endpoints are reachable through the pinhole; remote
- * URLs return undefined and go through the whitelist proxy instead.
+ * Best-effort kill of an agent's own host-side LLM relay process (started by
+ * host/launch-task.sh, pidfile at agents/<name>/relay.pid). Never throws —
+ * callers use this during down/destroy and must not fail the command if the
+ * relay isn't running or was never started.
+ */
+export function killAgentRelay(name: string): void {
+  try {
+    killPid(relayPidfilePath(name));
+  } catch {
+    // best-effort; teardown must not fail because of the relay
+  }
+}
+
+/**
+ * Best-effort kill of an agent's own host-side MCP relay process (started by
+ * host/launch-task.sh when --mcp-url is given, pidfile at
+ * agents/<name>/mcp-relay.pid). Never throws — most agents never start this
+ * relay at all (MCP is opt-in), so a missing pidfile is the common case, not
+ * an error.
+ */
+export function killAgentMcpRelay(name: string): void {
+  try {
+    killPid(mcpRelayPidfilePath(name));
+  } catch {
+    // best-effort; teardown must not fail because of the relay
+  }
+}
+
+/**
+ * Fallback/manual-override path: extract the LLM port from the agent's
+ * OPENAI_BASE_URL (agents/<name>/.env). Only local (localhost/127.0.0.1)
+ * endpoints are reachable through the pinhole; remote URLs return undefined.
+ * The default/automatic path is the agent's persisted `relay_port`
+ * (agent.json) — this is only consulted when that isn't available (e.g.
+ * agents created before per-agent relay ports existed).
  */
 export function llmPortFromAgentEnv(name: string): number | undefined {
   const envFile = agentEnvPath(name);
@@ -77,10 +109,41 @@ export function llmPortFromAgentEnv(name: string): number | undefined {
   return undefined;
 }
 
+/**
+ * Resolve the host-side LLM port to pinhole into the guest, in priority
+ * order: explicit override (--llm-port) > the agent's persisted relay_port
+ * (agent.json, always allocated at `create` time) > llmPortFromAgentEnv, a
+ * fallback for agent.json files written before relay_port existed.
+ */
+export function resolveLlmPort(
+  explicitLlmPort: number | undefined,
+  agent: Pick<AgentJson, 'relay_port'>,
+  name: string,
+): number | undefined {
+  return explicitLlmPort ?? agent.relay_port ?? llmPortFromAgentEnv(name);
+}
+
+/**
+ * Resolve the host-side MCP port to pinhole into the guest, in priority
+ * order: explicit override (--mcp-port) > the agent's persisted mcp_port
+ * (agent.json, only allocated when the agent opted into MCP at `create`
+ * time). Unlike resolveLlmPort there is no agent-env fallback — MCP has no
+ * pre-existing on-disk representation to fall back to, and returning
+ * undefined here is the normal case for the majority of agents that never
+ * opted into MCP (the pinhole then simply isn't opened; see buildNetdevString).
+ */
+export function resolveMcpPort(
+  explicitMcpPort: number | undefined,
+  agent: Pick<AgentJson, 'mcp_port'>,
+): number | undefined {
+  return explicitMcpPort ?? agent.mcp_port;
+}
+
 export interface UpOptions {
   dev?: boolean;
   gui?: boolean;
   llmPort?: number;
+  mcpPort?: number;
   ram?: string;
 }
 
@@ -94,13 +157,14 @@ export function execUpCommand(name: string, opts: UpOptions = {}): boolean {
   const sock = monitorSockPath(name);
   const dev = opts.dev ?? false;
   const gui = opts.gui ?? false;
-  const llmPort = opts.llmPort ?? llmPortFromAgentEnv(name);
+  const llmPort = resolveLlmPort(opts.llmPort, agent, name);
+  const mcpPort = resolveMcpPort(opts.mcpPort, agent);
   const workspace = path.join(agentDir(name), 'shared');
   const ram = opts.ram ?? agent.ram;
 
   const ok = startVm({
     disk, efi, sshPort: ssh_port, appPort: app_port, pidFile: pf, monitorSock: sock,
-    vncDisplay: vnc_display, dev, gui, llmPort, workspace, ram,
+    vncDisplay: vnc_display, dev, gui, llmPort, mcpPort, workspace, ram,
   });
 
   if (ok && dev && PLATFORM === 'win32' && GUEST_ARCH === 'x86_64') {
@@ -129,9 +193,10 @@ export function registerControlCommands(program: Command): void {
     .description('Start an agent')
     .option('--dev', 'Mount services/ via 9p (dev mode)')
     .option('--gui', 'Show QEMU window')
-    .option('--llm-port <port>', 'Host LLM port for the 10.0.2.101 pinhole (default: parsed from agent .env)')
+    .option('--llm-port <port>', "Host LLM port for the 10.0.2.101 pinhole (default: the agent's persisted relay_port)")
+    .option('--mcp-port <port>', "Host MCP port for the 10.0.2.102 pinhole (default: the agent's persisted mcp_port, if any)")
     .option('--ram <size>', "VM memory for this boot, e.g. 12G (default: agent's stored value, else 8G)")
-    .action((name: string, opts: { dev?: boolean; gui?: boolean; llmPort?: string; ram?: string }) => {
+    .action((name: string, opts: { dev?: boolean; gui?: boolean; llmPort?: string; mcpPort?: string; ram?: string }) => {
       if (!agentExists(name)) jsonErr(`Agent '${name}' not found.`);
       if (opts.ram !== undefined && !isValidRam(opts.ram)) {
         jsonErr(`Invalid --ram value '${opts.ram}'. Use a number followed by G or M, e.g. 12G or 4096M.`);
@@ -141,6 +206,7 @@ export function registerControlCommands(program: Command): void {
       const dev = opts.dev ?? false;
       const gui = opts.gui ?? false;
       const llmPort = opts.llmPort !== undefined ? parseInt(opts.llmPort, 10) : undefined;
+      const mcpPort = opts.mcpPort !== undefined ? parseInt(opts.mcpPort, 10) : undefined;
       const mode = dev
         ? (PLATFORM === 'win32' && GUEST_ARCH === 'x86_64' ? 'dev (scp sync)' : 'dev (9p mount)')
         : 'prod';
@@ -153,7 +219,7 @@ export function registerControlCommands(program: Command): void {
         }
       }
 
-      const ok = execUpCommand(name, { dev, gui, llmPort, ram: opts.ram });
+      const ok = execUpCommand(name, { dev, gui, llmPort, mcpPort, ram: opts.ram });
 
       if (isJsonMode()) {
         const pid = readPid(pidfilePath(name));
@@ -180,6 +246,8 @@ export function registerControlCommands(program: Command): void {
 
       if (!isRunning(pf)) {
         fs.rmSync(pf, { force: true });
+        killAgentRelay(name);
+        killAgentMcpRelay(name);
         if (isJsonMode()) {
           jsonOk({ name, was_running: false });
         } else {
@@ -189,6 +257,8 @@ export function registerControlCommands(program: Command): void {
       }
 
       waitForShutdown(pf, sock, ssh_port);
+      killAgentRelay(name);
+      killAgentMcpRelay(name);
       if (isJsonMode()) jsonOk({ name, was_running: true });
     });
 
@@ -302,6 +372,8 @@ export function registerControlCommands(program: Command): void {
           jsonOk({
             name, status: 'running', pid,
             ssh_port: agent.ssh_port, vnc_port: agent.vnc_port, app_port: agent.app_port,
+            relay_port: agent.relay_port,
+            ...(agent.mcp_port !== undefined ? { mcp_port: agent.mcp_port } : {}),
             desktop_url: `http://localhost:${agent.app_port}`,
           });
         } else {
@@ -315,6 +387,8 @@ export function registerControlCommands(program: Command): void {
           jsonOk({
             name, status: 'stopped',
             ssh_port: agent.ssh_port, vnc_port: agent.vnc_port, app_port: agent.app_port,
+            relay_port: agent.relay_port,
+            ...(agent.mcp_port !== undefined ? { mcp_port: agent.mcp_port } : {}),
           });
         } else {
           info(`Agent '${name}' is stopped.`);

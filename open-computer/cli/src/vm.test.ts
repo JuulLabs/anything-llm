@@ -91,6 +91,35 @@ test('buildNetdevString: without llmPort only the proxy pinhole opens', () => {
   assert.ok(!s.includes('10.0.2.101'));
 });
 
+test('buildNetdevString: mcpPort opens a third pinhole at 10.0.2.102', () => {
+  assert.equal(
+    buildNetdevString({ sshPort: 2222, appPort: 9800, llmPort: 1234, mcpPort: 4200 }),
+    'user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:9800-:18790'
+    + ',restrict=on'
+    + ',guestfwd=tcp:10.0.2.100:3128-cmd:nc 127.0.0.1 3128'
+    + ',guestfwd=tcp:10.0.2.101:1234-cmd:nc 127.0.0.1 1234'
+    + ',guestfwd=tcp:10.0.2.102:4200-cmd:nc 127.0.0.1 4200',
+  );
+});
+
+test('buildNetdevString: MCP pinhole is opt-in — absent without mcpPort, even with llmPort set', () => {
+  const s = buildNetdevString({ sshPort: 2222, llmPort: 1234 });
+  assert.ok(s.includes('10.0.2.101'));
+  assert.ok(!s.includes('10.0.2.102'));
+});
+
+test('buildNetdevString: MCP pinhole works standalone without an llmPort', () => {
+  const s = buildNetdevString({ sshPort: 2222, mcpPort: 4200 });
+  assert.ok(!s.includes('10.0.2.101'));
+  assert.ok(s.includes('guestfwd=tcp:10.0.2.102:4200-cmd:nc 127.0.0.1 4200'));
+});
+
+test('buildNetdevString: unrestricted (base image) omits the MCP pinhole too', () => {
+  const s = buildNetdevString({ sshPort: 2222, mcpPort: 4200, unrestricted: true });
+  assert.ok(!s.includes('guestfwd'));
+  assert.ok(!s.includes('10.0.2.102'));
+});
+
 test('buildNetdevString: custom proxy port is honored', () => {
   const s = buildNetdevString({ sshPort: 2222, proxyPort: 8888 });
   assert.ok(s.includes('guestfwd=tcp:10.0.2.100:8888-cmd:nc 127.0.0.1 8888'));

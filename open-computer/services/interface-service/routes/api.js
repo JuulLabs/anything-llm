@@ -4,7 +4,7 @@ const { workspace, currentAgentStatus } = require("../workspace");
 const { broadcast } = require("../broadcast");
 const { clearPendingInterrupt } = require("../interrupt");
 const { runPromptPreflight } = require("../preflight");
-const { cleanupDesktop, sendRpcPrompt } = require("../pi/process");
+const { cleanupDesktop, sendRpcPrompt, sendRpcSteer } = require("../pi/process");
 const { launchPiAgent, getTaskUsage } = require("../session/hypervisor");
 const { getProxyUsage, resetProxyUsage } = require("../llm-proxy");
 const {
@@ -228,7 +228,7 @@ function registerApiRoutes(app) {
   //   3. No agent running → run preflight classifier, then dispatch
 
   app.post("/api/v1/prompt", async (req, res) => {
-    const { prompt } = req.body;
+    const { prompt, mode } = req.body;
     if (!prompt) return res.status(400).json({ error: "prompt is required" });
     if (!settings.OPENAI_API_KEY && !settings.OPENAI_BASE_URL) {
       return res.status(500).json({
@@ -236,6 +236,19 @@ function registerApiRoutes(app) {
           "OPENAI_API_KEY not configured — POST /api/v1/config with api_key " +
           "(or set base_url for local providers)",
       });
+    }
+
+    // Explicit steer delivery — injects into the currently-running turn
+    // (after the current tool call, before the next LLM call) instead of
+    // queuing as a follow-up prompt. Only valid when a session is active.
+    if (mode === "steer") {
+      if (!workspace.piRpc) {
+        return res.status(400).json({ error: "no active session to steer" });
+      }
+      sendRpcSteer(prompt);
+      broadcast({ type: "agent_log", content: `[steer] Message sent: ${prompt}` });
+      broadcast({ type: "chat_message", content: prompt, role: "user" });
+      return res.json({ status: "steer_sent", workspace_id: workspace.id });
     }
 
     // If an agent has asked for help, this prompt is the user's response.

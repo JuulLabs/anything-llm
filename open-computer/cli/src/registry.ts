@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  AGENTS_DIR, BASE_DIR, SSH_PORT_BASE, VNC_DISPLAY_BASE, APP_PORT_BASE,
+  AGENTS_DIR, BASE_DIR, SSH_PORT_BASE, VNC_DISPLAY_BASE, APP_PORT_BASE, RELAY_PORT_BASE,
+  MCP_PORT_BASE,
 } from './config.js';
 
 export interface AgentJson {
@@ -11,9 +12,12 @@ export interface AgentJson {
   vnc_display: number;
   vnc_port: number;
   app_port: number;
+  relay_port: number;
   disk: string;
   created: string;
   ram?: string;
+  /** Only present when this agent opted into MCP forwarding (see `--mcp` on `create`). */
+  mcp_port?: number;
 }
 
 export function agentDir(name: string): string {
@@ -30,6 +34,14 @@ export function agentEnvPath(name: string): string {
 
 export function pidfilePath(name: string): string {
   return path.join(agentDir(name), 'qemu.pid');
+}
+
+export function relayPidfilePath(name: string): string {
+  return path.join(agentDir(name), 'relay.pid');
+}
+
+export function mcpRelayPidfilePath(name: string): string {
+  return path.join(agentDir(name), 'mcp-relay.pid');
 }
 
 export function monitorSockPath(name: string): string {
@@ -73,7 +85,14 @@ export function nextIndex(): number {
   return max + 1;
 }
 
-export function writeAgentJson(name: string, index: number, ram?: string): AgentJson {
+export interface WriteAgentJsonOptions {
+  ram?: string;
+  /** Opt this agent into MCP forwarding: allocates and persists `mcp_port`. */
+  mcp?: boolean;
+}
+
+export function writeAgentJson(name: string, index: number, opts: WriteAgentJsonOptions = {}): AgentJson {
+  const { ram, mcp } = opts;
   const dir = agentDir(name);
   const agent: AgentJson = {
     name,
@@ -82,9 +101,11 @@ export function writeAgentJson(name: string, index: number, ram?: string): Agent
     vnc_display: VNC_DISPLAY_BASE + index,
     vnc_port: 5900 + VNC_DISPLAY_BASE + index,
     app_port: APP_PORT_BASE + index,
+    relay_port: RELAY_PORT_BASE + index,
     disk: path.join(dir, 'disk.qcow2'),
     created: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     ...(ram !== undefined ? { ram } : {}),
+    ...(mcp ? { mcp_port: MCP_PORT_BASE + index } : {}),
   };
   fs.writeFileSync(agentJsonPath(name), JSON.stringify(agent, null, 2) + '\n');
   return agent;

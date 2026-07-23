@@ -182,6 +182,24 @@ cat > "$PI_AGENT_DIR/hermes-memory-config.json" <<'EOF'
 EOF
 chown -R "$REAL_USER:$REAL_USER" "$PI_AGENT_DIR"
 
+# ---------- pi-mcp-adapter (MCP tool access, opt-in per agent) ----------
+# Registers MCP servers listed in Pi's mcp.json-style config as native Pi
+# tools. We ship an EMPTY placeholder here (no servers) — exactly like the
+# per-agent .env is not baked into the image — because the real server entry
+# (pointing at THIS agent's own host MCP relay pinhole, never the real
+# upstream URL/token) is written per-agent by host/launch-task.sh at launch
+# time, only when --mcp-url is given. Agents that never pass --mcp-url see
+# only this empty config and pi-mcp-adapter simply has nothing to connect to.
+log "Installing pi-mcp-adapter extension"
+su - "$REAL_USER" -c "pi install npm:pi-mcp-adapter"
+
+cat > "$PI_AGENT_DIR/mcp.json" <<'EOF'
+{
+  "mcpServers": {}
+}
+EOF
+chown -R "$REAL_USER:$REAL_USER" "$PI_AGENT_DIR"
+
 # NOTE: pi-computer-use and pi-browser-cdp-extension are NOT installed.
 # We use custom extensions in /opt/open-computer/extensions/ instead:
 #   browser-cdp.ts  — our own CDP tool that evaluates JS directly in the page context

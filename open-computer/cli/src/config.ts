@@ -154,6 +154,18 @@ export const VM_USER = 'agent';
 export const SSH_PORT_BASE = 2222;
 export const VNC_DISPLAY_BASE = 1;
 export const APP_PORT_BASE = 9800;
+// Per-agent host-side LLM relay (host/llm-relay.mjs). Each agent gets its own
+// relay process/port so parallel agents can use different models/upstreams
+// simultaneously. Chosen to avoid every other port already claimed in this
+// repo: 2222+ (ssh), 3128 (whitelist proxy), 5900+ (vnc), 6080 (novnc),
+// 8090 (memory-manager), 9222 (cdp), 9800+ (app), 18790 (guest service).
+export const RELAY_PORT_BASE = 4100;
+
+// Per-agent host-side MCP relay (host/mcp-relay.mjs). Unlike RELAY_PORT_BASE,
+// this is opt-in per agent (MCP is not always configured), but the base is
+// still reserved unconditionally so its range never collides with any other
+// base above, RELAY_PORT_BASE's 4100+ range, or a realistic agent count.
+export const MCP_PORT_BASE = 4200;
 
 // Path inside the VM where the per-agent .env is staged
 export const VM_AGENT_ENV = '/home/agent/agent.env';
@@ -165,4 +177,5 @@ export const VM_AGENT_ENV = '/home/agent/agent.env';
 // /etc/hosts entries pushed over SSH.
 export const LOCKDOWN_PROXY_GUEST_IP = '10.0.2.100';
 export const LOCKDOWN_LLM_GUEST_IP = '10.0.2.101';
+export const LOCKDOWN_MCP_GUEST_IP = '10.0.2.102';
 export const LOCKDOWN_PROXY_PORT = 3128;

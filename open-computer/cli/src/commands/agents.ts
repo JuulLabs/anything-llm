@@ -9,7 +9,7 @@ import {
 } from '../registry.js';
 import { isRunning, readPid, killPid, qemuImgCreate, removeMonitorSock, isValidRam } from '../vm.js';
 import { isJsonMode, jsonOk, jsonErr, info } from '../output.js';
-import { execUpCommand } from './control.js';
+import { execUpCommand, killAgentRelay, killAgentMcpRelay } from './control.js';
 
 export function registerAgentCommands(program: Command): void {
   program
@@ -18,9 +18,11 @@ export function registerAgentCommands(program: Command): void {
     .option('--no-start', 'Create without starting')
     .option('--dev', 'Mount services/ via 9p (dev mode)')
     .option('--gui', 'Show QEMU window')
-    .option('--llm-port <port>', 'Host LLM port for the 10.0.2.101 pinhole (default: parsed from agent .env)')
+    .option('--llm-port <port>', "Host LLM port for the 10.0.2.101 pinhole (default: the agent's persisted relay_port)")
+    .option('--mcp', 'Opt this agent into MCP forwarding (allocates and persists mcp_port)')
+    .option('--mcp-port <port>', "Host MCP port for the 10.0.2.102 pinhole (default: the agent's persisted mcp_port, if --mcp was given)")
     .option('--ram <size>', 'VM memory, e.g. 12G (default 8G; persisted in agent.json)')
-    .action((name: string, _flags: string[], opts: { start: boolean; dev?: boolean; gui?: boolean; llmPort?: string; ram?: string }) => {
+    .action((name: string, _flags: string[], opts: { start: boolean; dev?: boolean; gui?: boolean; llmPort?: string; mcp?: boolean; mcpPort?: string; ram?: string }) => {
       if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
         jsonErr('Invalid name. Use alphanumeric, dash, underscore.');
       }
@@ -48,12 +50,16 @@ export function registerAgentCommands(program: Command): void {
         fs.copyFileSync(resolveEfiCode(), efiDest);
       }
 
-      const agent = writeAgentJson(name, index, opts.ram);
-      const { ssh_port, vnc_port, app_port } = agent;
+      const agent = writeAgentJson(name, index, { ram: opts.ram, mcp: opts.mcp });
+      const { ssh_port, vnc_port, app_port, relay_port, mcp_port } = agent;
 
       if (!opts.start) {
         if (isJsonMode()) {
-          jsonOk({ name, index, ssh_port, vnc_port, app_port, desktop_url: `http://localhost:${app_port}`, started: false });
+          jsonOk({
+            name, index, ssh_port, vnc_port, app_port, relay_port,
+            ...(mcp_port !== undefined ? { mcp_port } : {}),
+            desktop_url: `http://localhost:${app_port}`, started: false,
+          });
         } else {
           info(`Created agent '${name}':`);
           info(`  SSH:      ssh -p ${ssh_port} ${VM_USER}@localhost`);
@@ -69,11 +75,16 @@ export function registerAgentCommands(program: Command): void {
         dev: opts.dev ?? false,
         gui: opts.gui ?? false,
         llmPort: opts.llmPort !== undefined ? parseInt(opts.llmPort, 10) : undefined,
+        mcpPort: opts.mcpPort !== undefined ? parseInt(opts.mcpPort, 10) : undefined,
         ram: opts.ram,
       });
 
       if (isJsonMode()) {
-        jsonOk({ name, index, ssh_port, vnc_port, app_port, desktop_url: `http://localhost:${app_port}`, started });
+        jsonOk({
+          name, index, ssh_port, vnc_port, app_port, relay_port,
+          ...(mcp_port !== undefined ? { mcp_port } : {}),
+          desktop_url: `http://localhost:${app_port}`, started,
+        });
       } else {
         info(`Created agent '${name}':`);
         info(`  SSH:      ssh -p ${ssh_port} ${VM_USER}@localhost`);
@@ -94,6 +105,8 @@ export function registerAgentCommands(program: Command): void {
         killPid(pf);
         removeMonitorSock(monitorSockPath(name));
       }
+      killAgentRelay(name);
+      killAgentMcpRelay(name);
 
       fs.rmSync(agentDir(name), { recursive: true, force: true });
 
@@ -122,6 +135,8 @@ export function registerAgentCommands(program: Command): void {
             ssh_port: data.ssh_port,
             vnc_port: data.vnc_port,
             app_port: data.app_port,
+            relay_port: data.relay_port,
+            ...(data.mcp_port !== undefined ? { mcp_port: data.mcp_port } : {}),
             desktop_url: `http://localhost:${data.app_port}`,
             created: data.created,
             ...(pid !== null && pid !== undefined ? { pid } : {}),
