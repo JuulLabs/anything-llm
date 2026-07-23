@@ -13,6 +13,7 @@ export interface AgentJson {
   app_port: number;
   disk: string;
   created: string;
+  ram?: string;
 }
 
 export function agentDir(name: string): string {
@@ -72,7 +73,7 @@ export function nextIndex(): number {
   return max + 1;
 }
 
-export function writeAgentJson(name: string, index: number): AgentJson {
+export function writeAgentJson(name: string, index: number, ram?: string): AgentJson {
   const dir = agentDir(name);
   const agent: AgentJson = {
     name,
@@ -83,6 +84,7 @@ export function writeAgentJson(name: string, index: number): AgentJson {
     app_port: APP_PORT_BASE + index,
     disk: path.join(dir, 'disk.qcow2'),
     created: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    ...(ram !== undefined ? { ram } : {}),
   };
   fs.writeFileSync(agentJsonPath(name), JSON.stringify(agent, null, 2) + '\n');
   return agent;

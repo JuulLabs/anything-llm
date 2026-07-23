@@ -1,0 +1,41 @@
+# One domain per line. Bare entries match only that exact host.
+# Use *.domain to allow subdomains (foo.domain, a.b.domain), not the bare host.
+
+# Gradle
+services.gradle.org
+plugins.gradle.org
+plugins-artifacts.gradle.org
+
+# Maven
+repo1.maven.org
+repo.maven.apache.org
+dl.google.com
+maven.google.com
+
+# JetBrains
+download.jetbrains.com
+
+# Node
+nodejs.org
+npmjs.org
+registry.npmjs.org
+yarnpkg.com
+registry.yarnpkg.com
+
+# GitHub
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+release-assets.githubusercontent.com
+raw.githubusercontent.com
+
+# JDK host
+api.foojay.io
+corretto.aws
+
+# Company domains (add *.domain for subdomains)
+juul.com
+*.juul.com
+runtime.io
+*.runtime.io

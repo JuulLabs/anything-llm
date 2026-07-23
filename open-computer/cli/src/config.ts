@@ -146,7 +146,7 @@ export function isoPath(): string {
 // ── VM defaults ──────────────────────────────────────────────────────────────
 
 export const CPUS = 4;
-export const RAM = '4G';
+export const RAM = '8G';
 export const DISK_SIZE = '40G';
 export const VM_USER = 'agent';
 
@@ -157,3 +157,12 @@ export const APP_PORT_BASE = 9800;
 
 // Path inside the VM where the per-agent .env is staged
 export const VM_AGENT_ENV = '/home/agent/agent.env';
+
+// ── Lockdown networking ──────────────────────────────────────────────────────
+// With restrict=on, the guest can only reach explicit guestfwd pinholes.
+// slirp's built-in DNS (10.0.2.3) is dropped under restrict=on, so hostname
+// resolution must happen host-side (the HTTP proxy resolves names) or via
+// /etc/hosts entries pushed over SSH.
+export const LOCKDOWN_PROXY_GUEST_IP = '10.0.2.100';
+export const LOCKDOWN_LLM_GUEST_IP = '10.0.2.101';
+export const LOCKDOWN_PROXY_PORT = 3128;

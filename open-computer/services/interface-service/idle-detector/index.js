@@ -1,7 +1,11 @@
 const { workspace } = require("../workspace");
 const { broadcast } = require("../broadcast");
 
-const IDLE_THRESHOLD_MS = 60_000;
+const IDLE_DETECTOR_DISABLED = /^(off|0|false)$/i.test(
+  process.env.IDLE_DETECTOR || "",
+);
+const IDLE_THRESHOLD_MS =
+  parseInt(process.env.IDLE_THRESHOLD_MS) || 60_000;
 const IDLE_CHECK_INTERVAL_MS = 5_000;
 
 // Fires when the hypervisor agent has been running but idle (no RPC events)
@@ -32,6 +36,10 @@ function checkAgentIdle() {
 }
 
 function startIdleDetector() {
+  if (IDLE_DETECTOR_DISABLED) {
+    console.log("[idle] Idle detector disabled (IDLE_DETECTOR=off)");
+    return;
+  }
   setInterval(checkAgentIdle, IDLE_CHECK_INTERVAL_MS);
 }
 

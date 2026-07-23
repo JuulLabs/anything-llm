@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMachineArgs, gpuDeviceArgs, isoDeviceArgs } from './vm.js';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { buildMachineArgs, gpuDeviceArgs, isoDeviceArgs, buildNetdevString, workspaceFsdevArgs, isValidRam, buildQemuArgs } from './vm.js';
 
 // These tests lock in the Windows x64 (WHPX) behavior and, just as importantly,
 // prove the macOS/Linux paths are unchanged (no VGA, no q35-only ide-cd bus).
@@ -59,4 +62,86 @@ test('isoDeviceArgs: no CD-ROM on macOS/Linux', () => {
 
 test('isoDeviceArgs: no CD-ROM when no ISO is provided', () => {
   assert.deepEqual(isoDeviceArgs(undefined, 'win32'), []);
+});
+
+test('buildNetdevString: hostfwd entries are bound to loopback', () => {
+  const s = buildNetdevString({ sshPort: 2222, appPort: 9800 });
+  assert.ok(s.startsWith('user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:9800-:18790'));
+});
+
+test('buildNetdevString: no app forward without appPort', () => {
+  const s = buildNetdevString({ sshPort: 2222 });
+  assert.ok(!s.includes('18790'));
+});
+
+test('buildNetdevString: default is restricted with proxy/LLM pinholes', () => {
+  assert.equal(
+    buildNetdevString({ sshPort: 2222, appPort: 9800, llmPort: 1234 }),
+    'user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:9800-:18790'
+    + ',restrict=on'
+    + ',guestfwd=tcp:10.0.2.100:3128-cmd:nc 127.0.0.1 3128'
+    + ',guestfwd=tcp:10.0.2.101:1234-cmd:nc 127.0.0.1 1234',
+  );
+});
+
+test('buildNetdevString: without llmPort only the proxy pinhole opens', () => {
+  const s = buildNetdevString({ sshPort: 2222 });
+  assert.ok(s.includes('restrict=on'));
+  assert.ok(s.includes('guestfwd=tcp:10.0.2.100:3128-cmd:nc 127.0.0.1 3128'));
+  assert.ok(!s.includes('10.0.2.101'));
+});
+
+test('buildNetdevString: custom proxy port is honored', () => {
+  const s = buildNetdevString({ sshPort: 2222, proxyPort: 8888 });
+  assert.ok(s.includes('guestfwd=tcp:10.0.2.100:8888-cmd:nc 127.0.0.1 8888'));
+});
+
+test('buildNetdevString: unrestricted (base image) has no restrict or pinholes', () => {
+  const s = buildNetdevString({ sshPort: 2222, appPort: 9800, unrestricted: true });
+  assert.equal(s, 'user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:9800-:18790');
+  assert.ok(!s.includes('restrict'));
+  assert.ok(!s.includes('guestfwd'));
+});
+
+test('workspaceFsdevArgs: builds the 9p workspace share', () => {
+  assert.deepEqual(workspaceFsdevArgs('/tmp/agents/foo/shared'), [
+    '-fsdev', 'local,id=workspace,path=/tmp/agents/foo/shared,security_model=mapped-xattr',
+    '-device', 'virtio-9p-pci,fsdev=workspace,mount_tag=open-computer_shared',
+  ]);
+});
+
+test('workspaceFsdevArgs: empty when no workspace path', () => {
+  assert.deepEqual(workspaceFsdevArgs(undefined), []);
+});
+
+test('isValidRam: accepts N followed by G/M, rejects everything else', () => {
+  for (const ok of ['8G', '12G', '512M', '4096m', '2g']) assert.ok(isValidRam(ok));
+  for (const bad of ['8', 'G8', '8GB', '8 G', '1.5G', '', '8T']) assert.ok(!isValidRam(bad));
+});
+
+function ramFromArgs(ram?: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-vmtest-'));
+  const efi = path.join(dir, 'efi-vars.fd');
+  fs.writeFileSync(efi, '');
+  try {
+    const args = buildQemuArgs({
+      disk: path.join(dir, 'disk.qcow2'),
+      efi,
+      sshPort: 2222,
+      pidFile: path.join(dir, 'qemu.pid'),
+      monitorSock: path.join(dir, 'monitor.sock'),
+      ram,
+    });
+    return args[args.indexOf('-m') + 1];
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('buildQemuArgs: -m defaults to 8G', () => {
+  assert.equal(ramFromArgs(), '8G');
+});
+
+test('buildQemuArgs: -m honors the ram override', () => {
+  assert.equal(ramFromArgs('12G'), '12G');
 });

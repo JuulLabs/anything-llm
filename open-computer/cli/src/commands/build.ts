@@ -169,7 +169,7 @@ ExecStart=/opt/open-computer/start-service.sh
 Restart=always
 RestartSec=3
 Environment=HOME=/home/agent
-Environment=PORT=8080
+Environment=PORT=18790
 
 [Install]
 WantedBy=graphical.target`;

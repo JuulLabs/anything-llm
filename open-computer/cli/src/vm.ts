@@ -3,6 +3,7 @@ import * as path from 'path';
 import { spawnSync, spawn } from 'child_process';
 import {
   PLATFORM, GUEST_ARCH, CPUS, RAM, SERVICE_DIR,
+  LOCKDOWN_PROXY_GUEST_IP, LOCKDOWN_LLM_GUEST_IP, LOCKDOWN_PROXY_PORT,
   resolveQemuBinary, resolveQemuImgBinary, resolveEfiCode, resolveEfiVars,
   type Platform,
 } from './config.js';
@@ -64,6 +65,56 @@ interface QemuArgsOptions {
   vncDisplay?: number;
   /** Optional installer ISO to attach as a bootable CD-ROM (used by `base install`). */
   iso?: string;
+  /** Unrestricted slirp networking (base image build path only). */
+  unrestricted?: boolean;
+  /** Host-side LLM port exposed to the guest via the 10.0.2.101 pinhole. */
+  llmPort?: number;
+  /** Host-side whitelist proxy port (default 3128), pinholed at 10.0.2.100. */
+  proxyPort?: number;
+  /** Host path of the per-agent read-write workspace share. */
+  workspace?: string;
+  /** VM memory size (e.g. '12G'); defaults to the RAM constant. */
+  ram?: string;
+}
+
+export function isValidRam(value: string): boolean {
+  return /^\d+[GgMm]$/.test(value);
+}
+
+export interface NetdevOptions {
+  sshPort: number;
+  appPort?: number;
+  unrestricted?: boolean;
+  llmPort?: number;
+  proxyPort?: number;
+}
+
+export function buildNetdevString(opts: NetdevOptions): string {
+  const { sshPort, appPort, unrestricted, llmPort, proxyPort = LOCKDOWN_PROXY_PORT } = opts;
+  let netdev = `user,id=net0,hostfwd=tcp:127.0.0.1:${sshPort}-:22`;
+  if (appPort !== undefined) {
+    netdev += `,hostfwd=tcp:127.0.0.1:${appPort}-:18790`;
+  }
+  if (!unrestricted) {
+    // restrict=on isolates the guest; only hostfwd/guestfwd rules pass.
+    // The `cmd:` guestfwd form spawns one nc per guest connection; the
+    // `tcp:host:port` chardev form shares a single host socket across all
+    // guest connections, which corrupts concurrent proxy traffic.
+    netdev += ',restrict=on';
+    netdev += `,guestfwd=tcp:${LOCKDOWN_PROXY_GUEST_IP}:${proxyPort}-cmd:nc 127.0.0.1 ${proxyPort}`;
+    if (llmPort !== undefined) {
+      netdev += `,guestfwd=tcp:${LOCKDOWN_LLM_GUEST_IP}:${llmPort}-cmd:nc 127.0.0.1 ${llmPort}`;
+    }
+  }
+  return netdev;
+}
+
+export function workspaceFsdevArgs(workspace: string | undefined): string[] {
+  if (!workspace) return [];
+  return [
+    '-fsdev', `local,id=workspace,path=${workspace},security_model=mapped-xattr`,
+    '-device', 'virtio-9p-pci,fsdev=workspace,mount_tag=open-computer_shared',
+  ];
 }
 
 // Machine/accelerator/CPU flags. Pure and parameterized so the platform matrix
@@ -109,25 +160,26 @@ export function isoDeviceArgs(iso: string | undefined, platform: Platform = PLAT
 }
 
 export function buildQemuArgs(opts: QemuArgsOptions): string[] {
-  const { disk, efi, sshPort, pidFile, monitorSock, appPort, dev, vncDisplay = 1, iso } = opts;
+  const {
+    disk, efi, sshPort, pidFile, monitorSock, appPort, dev, vncDisplay = 1, iso,
+    unrestricted, llmPort, proxyPort, workspace, ram,
+  } = opts;
   const efiCode = resolveEfiCode();
 
   // Ensure per-VM efi-vars.fd exists. Windows needs the OVMF VARS template
   // (copying CODE leaves OVMF without a variable store); other platforms keep
   // the original behavior so their setup is unchanged.
   if (!fs.existsSync(efi)) {
+    fs.mkdirSync(path.dirname(efi), { recursive: true });
     fs.copyFileSync(PLATFORM === 'win32' ? resolveEfiVars() : efiCode, efi);
   }
 
-  let netdev = `user,id=net0,hostfwd=tcp::${sshPort}-:22`;
-  if (appPort !== undefined) {
-    netdev += `,hostfwd=tcp::${appPort}-:8080`;
-  }
+  const netdev = buildNetdevString({ sshPort, appPort, unrestricted, llmPort, proxyPort });
 
   const args: string[] = [
     ...buildMachineArgs(),
     '-smp', String(CPUS),
-    '-m', RAM,
+    '-m', ram ?? RAM,
     '-drive', `if=pflash,format=raw,readonly=on,file=${efiCode}`,
     '-drive', `if=pflash,format=raw,file=${efi}`,
     '-drive', `if=virtio,format=qcow2,discard=unmap,detect-zeroes=unmap,file=${disk}`,
@@ -144,6 +196,11 @@ export function buildQemuArgs(opts: QemuArgsOptions): string[] {
 
   // Attach the installer ISO as a bootable CD-ROM (base install only, Windows).
   args.push(...isoDeviceArgs(iso));
+
+  if (workspace && !(PLATFORM === 'win32' && GUEST_ARCH === 'x86_64')) {
+    fs.mkdirSync(workspace, { recursive: true });
+    args.push(...workspaceFsdevArgs(workspace));
+  }
 
   if (dev) {
     // 9p virtio host share (dev mode): supported on macOS and Windows ARM64

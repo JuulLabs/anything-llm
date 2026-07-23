@@ -25,8 +25,10 @@ Operational rules:
 - Use open_browser for web pages and app_open/app_* tools for native desktop apps; do not launch GUI apps from bash.
 - Use bash for CLI work, scripts, package installs, and file operations. GUI commands need DISPLAY=:0 if no dedicated tool exists.
 - Use ask_user for any clarification or decision that needs the user.
-- File locations: use /tmp or /home/agent/workspace for all intermediate and working files (scripts, data downloads, scratch files, intermediate outputs). Only call save_deliverable for the final output the user explicitly asked for — do not save intermediate or working files as deliverables.
+- File locations: /home/agent/shared is the shared task folder — task inputs (such as a cloned repo) arrive there, and final outputs must be copied back there. It is a slow shared mount also visible to the user; do not build or edit in place. Always copy repos/inputs to /home/agent/workspace first and do all work (builds, tests, edits) there, then copy changed files and final results back to /home/agent/shared when the task completes. Use /tmp for scratch files. Only call save_deliverable for the final output the user explicitly asked for — do not save intermediate or working files as deliverables.
+- When working in a repository, first look for agent instruction files and follow them: AGENTS.md (root and subdirectories), CLAUDE.md, and Cursor rules (.cursor/rules/*.mdc, .cursorrules). Repo-specific instructions take precedence over these general rules.
 - User-uploaded files are in ~/uploads.
+- Ports 18790, 5900, 6080, 8090, and 9222 are reserved by system services. Never kill processes bound to them and never bind your own servers to them. Run dev servers on other ports (e.g. 3000, 5173, 8081).
 - Never fabricate facts, titles, summaries, citations, or data. Fetch/read real content before reporting on it.`;
 
 // ─── Desktop cleanup ───────────────────────────────────────────────────────
@@ -182,6 +184,31 @@ function buildPiArgs({ sessionId, extensions, systemPrompt }) {
   return { args, guestBaseUrl, isLocalProvider };
 }
 
+// /etc/environment is only applied by PAM at login; this service runs under
+// systemd, so proxy vars pushed by host/launch-task.sh never reach process.env.
+// Load them here so agent-spawned commands can use the whitelist proxy.
+function loadSystemEnvironment() {
+  const env = {};
+  try {
+    const lines = fs.readFileSync("/etc/environment", "utf8").split("\n");
+    for (const line of lines) {
+      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!m) continue;
+      let value = m[2].trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      env[m[1]] = value;
+    }
+  } catch {
+    // No /etc/environment (e.g. non-VM dev) — nothing to load.
+  }
+  return env;
+}
+
 // ─── Pi process launcher ───────────────────────────────────────────────────
 // Spawns a pi agent in RPC mode and wires up stdio line-buffering, error
 // logging, and a deferred prompt send.  Returns the ChildProcess.
@@ -210,6 +237,7 @@ function launchPiProcess({
 
   const agentEnv = {
     ...process.env,
+    ...loadSystemEnvironment(),
     HOME: "/home/agent",
     DISPLAY: ":0",
     DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/1000/bus`,

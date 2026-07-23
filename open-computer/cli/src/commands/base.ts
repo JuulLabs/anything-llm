@@ -63,6 +63,8 @@ export function registerBaseCommand(program: Command): void {
         monitorSock: sock,
         gui: true,
         daemonize: false,
+        // Base image provisioning needs real network access (apt, npm).
+        unrestricted: true,
       });
     });
 
@@ -81,7 +83,7 @@ export function registerBaseCommand(program: Command): void {
           disk: BASE_DISK, efi: BASE_EFI,
           sshPort: BASE_SSH_PORT, appPort: BASE_APP_PORT,
           pidFile: pf, monitorSock: sock,
-          gui: true, daemonize: false, dev: true,
+          gui: true, daemonize: false, dev: true, unrestricted: true,
         });
         return;
       }
@@ -91,7 +93,7 @@ export function registerBaseCommand(program: Command): void {
         disk: BASE_DISK, efi: BASE_EFI,
         sshPort: BASE_SSH_PORT, appPort: BASE_APP_PORT,
         pidFile: pf, monitorSock: sock,
-        dev: true,
+        dev: true, unrestricted: true,
       });
     });
 

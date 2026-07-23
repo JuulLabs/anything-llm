@@ -36,7 +36,7 @@ function registerApiRoutes(app) {
       platform: process.platform,
       arch: process.arch,
       memory_mb: Math.floor(process.memoryUsage.rss() / 1024 / 1024),
-      port: process.env.PORT || 8080,
+      port: process.env.PORT || 18790,
     });
   });
 
@@ -455,7 +455,7 @@ function registerApiRoutes(app) {
       platform: process.platform,
       arch: process.arch,
       memory_mb: Math.floor(process.memoryUsage.rss() / 1024 / 1024),
-      port: process.env.PORT || 8080,
+      port: process.env.PORT || 18790,
       endpoints: {
         api: "/api/v1/",
         events: "/ws/events",

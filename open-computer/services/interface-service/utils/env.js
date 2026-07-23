@@ -1,7 +1,9 @@
 const fs = require("fs");
 const path = require("path");
 
-const QEMU_HOST_GATEWAY = "10.0.2.2";
+// With restrict=on, the slirp gateway (10.0.2.2) is unreachable; the host LLM
+// is exposed via a guestfwd pinhole at this address instead.
+const LLM_GATEWAY = "10.0.2.101";
 
 // Default location of the per-agent .env inside the VM. The open-computer CLI scp's
 // agents/<name>/.env here on boot so each agent VM can deterministically
@@ -77,15 +79,12 @@ function normalizeBaseUrl(url) {
 
 function resolveBaseUrlForGuest(url) {
   if (!url) return "";
-  return normalizeBaseUrl(url).replace(
-    /localhost|127\.0\.0\.1/g,
-    QEMU_HOST_GATEWAY,
-  );
+  return normalizeBaseUrl(url).replace(/localhost|127\.0\.0\.1/g, LLM_GATEWAY);
 }
 
 module.exports = {
   DEFAULT_AGENT_ENV,
-  QEMU_HOST_GATEWAY,
+  LLM_GATEWAY,
   envFlag,
   loadAgentEnv,
   loadDotEnv,

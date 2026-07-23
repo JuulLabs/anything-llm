@@ -7,7 +7,7 @@ import {
   readAgentJson, writeAgentJson, nextIndex, listAgents,
   pidfilePath, monitorSockPath, efiVarsPath,
 } from '../registry.js';
-import { isRunning, readPid, killPid, qemuImgCreate, removeMonitorSock } from '../vm.js';
+import { isRunning, readPid, killPid, qemuImgCreate, removeMonitorSock, isValidRam } from '../vm.js';
 import { isJsonMode, jsonOk, jsonErr, info } from '../output.js';
 import { execUpCommand } from './control.js';
 
@@ -18,9 +18,14 @@ export function registerAgentCommands(program: Command): void {
     .option('--no-start', 'Create without starting')
     .option('--dev', 'Mount services/ via 9p (dev mode)')
     .option('--gui', 'Show QEMU window')
-    .action((name: string, _flags: string[], opts: { start: boolean; dev?: boolean; gui?: boolean }) => {
+    .option('--llm-port <port>', 'Host LLM port for the 10.0.2.101 pinhole (default: parsed from agent .env)')
+    .option('--ram <size>', 'VM memory, e.g. 12G (default 8G; persisted in agent.json)')
+    .action((name: string, _flags: string[], opts: { start: boolean; dev?: boolean; gui?: boolean; llmPort?: string; ram?: string }) => {
       if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
         jsonErr('Invalid name. Use alphanumeric, dash, underscore.');
+      }
+      if (opts.ram !== undefined && !isValidRam(opts.ram)) {
+        jsonErr(`Invalid --ram value '${opts.ram}'. Use a number followed by G or M, e.g. 12G or 4096M.`);
       }
       if (agentExists(name)) jsonErr(`Agent '${name}' already exists.`);
       if (!fs.existsSync(BASE_DISK)) {
@@ -29,7 +34,7 @@ export function registerAgentCommands(program: Command): void {
 
       const dir = agentDir(name);
       const index = nextIndex();
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(path.join(dir, 'shared'), { recursive: true });
 
       // Create COW overlay
       qemuImgCreate(`${dir}/disk.qcow2`, BASE_DISK, '40G');
@@ -43,7 +48,7 @@ export function registerAgentCommands(program: Command): void {
         fs.copyFileSync(resolveEfiCode(), efiDest);
       }
 
-      const agent = writeAgentJson(name, index);
+      const agent = writeAgentJson(name, index, opts.ram);
       const { ssh_port, vnc_port, app_port } = agent;
 
       if (!opts.start) {
@@ -60,7 +65,12 @@ export function registerAgentCommands(program: Command): void {
         return;
       }
 
-      const started = execUpCommand(name, { dev: opts.dev ?? false, gui: opts.gui ?? false });
+      const started = execUpCommand(name, {
+        dev: opts.dev ?? false,
+        gui: opts.gui ?? false,
+        llmPort: opts.llmPort !== undefined ? parseInt(opts.llmPort, 10) : undefined,
+        ram: opts.ram,
+      });
 
       if (isJsonMode()) {
         jsonOk({ name, index, ssh_port, vnc_port, app_port, desktop_url: `http://localhost:${app_port}`, started });

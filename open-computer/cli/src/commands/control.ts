@@ -4,12 +4,12 @@ import { spawnSync } from 'child_process';
 import { Command } from 'commander';
 import { PLATFORM, GUEST_ARCH, VM_USER, SETUP_DIR, SERVICE_DIR, BASE_DISK } from '../config.js';
 import {
-  agentExists, readAgentJson, agentEnvPath,
+  agentExists, readAgentJson, agentEnvPath, agentDir,
   pidfilePath, monitorSockPath, efiVarsPath,
 } from '../registry.js';
 import {
   isRunning, readPid, killPid, startVm, waitForShutdown,
-  qemuImgConvert, fileSize, formatBytes, removeMonitorSock,
+  qemuImgConvert, fileSize, formatBytes, removeMonitorSock, isValidRam,
 } from '../vm.js';
 import { sshRun, sshInteractive, scpTo, waitForSsh } from '../ssh.js';
 import { isJsonMode, jsonOk, jsonErr, info } from '../output.js';
@@ -53,7 +53,38 @@ function syncServiceToVm(sshPort: number): void {
   info('  Service synced.');
 }
 
-export function execUpCommand(name: string, opts: { dev?: boolean; gui?: boolean } = {}): boolean {
+/**
+ * Extract the LLM port from the agent's OPENAI_BASE_URL (agents/<name>/.env)
+ * to open the 10.0.2.101 guestfwd pinhole to it. Only local
+ * (localhost/127.0.0.1) endpoints are reachable through the pinhole; remote
+ * URLs return undefined and go through the whitelist proxy instead.
+ */
+export function llmPortFromAgentEnv(name: string): number | undefined {
+  const envFile = agentEnvPath(name);
+  if (!fs.existsSync(envFile)) return undefined;
+  for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
+    const m = line.trim().match(/^OPENAI_BASE_URL\s*=\s*["']?([^"'\s]+)/);
+    if (!m) continue;
+    try {
+      const url = new URL(m[1]);
+      if (url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') return undefined;
+      if (url.port) return parseInt(url.port, 10);
+      return url.protocol === 'https:' ? 443 : 80;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+export interface UpOptions {
+  dev?: boolean;
+  gui?: boolean;
+  llmPort?: number;
+  ram?: string;
+}
+
+export function execUpCommand(name: string, opts: UpOptions = {}): boolean {
   if (!agentExists(name)) { jsonErr(`Agent '${name}' not found.`); }
 
   const agent = readAgentJson(name);
@@ -63,8 +94,14 @@ export function execUpCommand(name: string, opts: { dev?: boolean; gui?: boolean
   const sock = monitorSockPath(name);
   const dev = opts.dev ?? false;
   const gui = opts.gui ?? false;
+  const llmPort = opts.llmPort ?? llmPortFromAgentEnv(name);
+  const workspace = path.join(agentDir(name), 'shared');
+  const ram = opts.ram ?? agent.ram;
 
-  const ok = startVm({ disk, efi, sshPort: ssh_port, appPort: app_port, pidFile: pf, monitorSock: sock, vncDisplay: vnc_display, dev, gui });
+  const ok = startVm({
+    disk, efi, sshPort: ssh_port, appPort: app_port, pidFile: pf, monitorSock: sock,
+    vncDisplay: vnc_display, dev, gui, llmPort, workspace, ram,
+  });
 
   if (ok && dev && PLATFORM === 'win32' && GUEST_ARCH === 'x86_64') {
     const ready = waitForSsh(ssh_port, VM_USER, 60, 3);
@@ -92,12 +129,18 @@ export function registerControlCommands(program: Command): void {
     .description('Start an agent')
     .option('--dev', 'Mount services/ via 9p (dev mode)')
     .option('--gui', 'Show QEMU window')
-    .action((name: string, opts: { dev?: boolean; gui?: boolean }) => {
+    .option('--llm-port <port>', 'Host LLM port for the 10.0.2.101 pinhole (default: parsed from agent .env)')
+    .option('--ram <size>', "VM memory for this boot, e.g. 12G (default: agent's stored value, else 8G)")
+    .action((name: string, opts: { dev?: boolean; gui?: boolean; llmPort?: string; ram?: string }) => {
       if (!agentExists(name)) jsonErr(`Agent '${name}' not found.`);
+      if (opts.ram !== undefined && !isValidRam(opts.ram)) {
+        jsonErr(`Invalid --ram value '${opts.ram}'. Use a number followed by G or M, e.g. 12G or 4096M.`);
+      }
 
       const agent = readAgentJson(name);
       const dev = opts.dev ?? false;
       const gui = opts.gui ?? false;
+      const llmPort = opts.llmPort !== undefined ? parseInt(opts.llmPort, 10) : undefined;
       const mode = dev
         ? (PLATFORM === 'win32' && GUEST_ARCH === 'x86_64' ? 'dev (scp sync)' : 'dev (9p mount)')
         : 'prod';
@@ -110,7 +153,7 @@ export function registerControlCommands(program: Command): void {
         }
       }
 
-      const ok = execUpCommand(name, { dev, gui });
+      const ok = execUpCommand(name, { dev, gui, llmPort, ram: opts.ram });
 
       if (isJsonMode()) {
         const pid = readPid(pidfilePath(name));

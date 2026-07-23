@@ -26,7 +26,7 @@ const AGENT_NAME = process.env.AGENT_NAME || "agent";
 const DELIVERABLES_DIR = "/home/agent/deliverables";
 const LOGS_DIR = "/home/agent/logs";
 const EXTENSIONS_DIR = path.join(SERVICE_ROOT, "extensions");
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 18790;
 
 const LOG_BUFFER_MAX = 500;
 const VM_LOG_BUFFER_MAX = 500;

@@ -3,7 +3,7 @@
 # Provision a minimal Debian ARM64 VM with:
 #   - XFCE desktop
 #   - Chromium with CDP (remote debugging)
-#   - Python 3 + Node.js 22
+#   - Python 3 + Node.js 22 + OpenJDK 21 (Kotlin Multiplatform)
 #   - pi.dev coding agent + custom extensions
 #
 # Run as root inside the VM.
@@ -98,6 +98,31 @@ log "Installing Node.js 22"
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y --no-install-recommends nodejs
 
+# ---------- Kotlin Multiplatform (web/wasm) ----------
+log "Installing OpenJDK 21 for Kotlin Multiplatform"
+apt-get install -y --no-install-recommends openjdk-21-jdk-headless
+
+log "Configuring JAVA_HOME"
+JAVA_ARCH="$(dpkg --print-architecture)"
+cat > /etc/profile.d/java21.sh <<EOF
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-${JAVA_ARCH}
+export PATH="\$JAVA_HOME/bin:\$PATH"
+EOF
+
+log "Configuring git identity for $REAL_USER"
+su - "$REAL_USER" -c 'git config --global user.name "Open Computer Agent"'
+su - "$REAL_USER" -c 'git config --global user.email "agent@open-computer.local"'
+
+log "Configuring Gradle defaults for $REAL_USER"
+mkdir -p "/home/$REAL_USER/.gradle"
+cat > "/home/$REAL_USER/.gradle/gradle.properties" <<'EOF'
+org.gradle.jvmargs=-Xmx3g
+org.gradle.daemon=false
+
+# Proxy properties are injected at VM launch time.
+EOF
+chown -R "$REAL_USER:$REAL_USER" "/home/$REAL_USER/.gradle"
+
 # ---------- curl wrapper (HTML→Markdown interception) ----------
 log "Installing curl wrapper"
 cp /tmp/curl-wrapper.sh /usr/local/bin/curl
@@ -170,6 +195,11 @@ log "Configuring Chromium to launch with CDP on port $CDP_PORT"
 mkdir -p /etc/chromium.d
 cat > /etc/chromium.d/cdp-flags <<EOF
 export CHROMIUM_FLAGS="\$CHROMIUM_FLAGS --remote-debugging-port=$CDP_PORT --disable-session-crashed-bubble"
+EOF
+
+log "Configuring Chromium SwiftShader flags for Skiko/wasm rendering"
+cat > /etc/chromium.d/swiftshader-flags <<'EOF'
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader"
 EOF
 
 # ---------- timezone ----------
@@ -266,6 +296,22 @@ ExecStart=/bin/sh -c 'mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576
 WantedBy=multi-user.target
 EOF
 
+log "Creating systemd service: open-computer-shared-mount (9p per-agent shared folder)"
+cat > /etc/systemd/system/open-computer-shared-mount.service <<'EOF'
+[Unit]
+Description=Mount 9p open-computer per-agent shared folder
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'mkdir -p /home/agent/shared; mount -t 9p -o trans=virtio,version=9p2000.L,msize=104857600 open-computer_shared /home/agent/shared 2>/dev/null; chown agent:agent /home/agent/shared; mkdir -p /home/agent/workspace; chown agent:agent /home/agent/workspace; true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 log "Creating systemd service: open-computer"
 cat > /etc/systemd/system/open-computer.service <<'EOF'
 [Unit]
@@ -281,7 +327,7 @@ ExecStart=/opt/open-computer/start-service.sh
 Restart=always
 RestartSec=3
 Environment=HOME=/home/agent
-Environment=PORT=8080
+Environment=PORT=18790
 
 [Install]
 WantedBy=graphical.target
@@ -308,7 +354,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable open-computer-mount open-computer memory-manager
+systemctl enable open-computer-mount open-computer-shared-mount open-computer memory-manager
 
 # ---------- mount point for service directory ----------
 log "Creating /opt/open-computer mount point"
