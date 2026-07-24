@@ -12,7 +12,12 @@ Usage: host/launch-task.sh --name <agent> --repo <org/repo> [options]
 
 Required:
   --name <agent-name>       Agent name (alphanumeric, dash, underscore)
-  --repo <org/repo>         GitHub repository to clone into the agent workspace
+  --repo <org/repo>         GitHub repository delivered to the agent as
+                            shared/input.tar (cloned host-side to a temp dir)
+  --mcp-url <url>           Upstream MCP server URL (Streamable HTTP) for the
+                            HOST MCP relay to forward to (e.g.
+                            https://mcp.atlassian.com/v1/mcp). The guest never
+                            talks to this URL directly.
 
 Optional:
   --branch <branch>         Branch to clone
@@ -27,11 +32,6 @@ Optional:
                             outbound requests, never written to the guest .env.
   --ai-model <model>        LLM OPENAI_MODEL (passed through to the guest as-is)
   --ai-context-length <n>   CONTEXT_WINDOW
-  --mcp-url <url>           Upstream MCP server URL (Streamable HTTP) for the
-                            HOST MCP relay to forward to. Optional — omit it
-                            and this agent gets no MCP relay, no MCP port
-                            allocation, and no guest MCP config at all. The
-                            guest never talks to this URL directly.
   --ram <size>              VM memory, e.g. 12G (default 8G; persisted per agent)
   --help                    Show this help
 
@@ -49,14 +49,13 @@ Re-running this script for the SAME agent always restarts just that agent's
 relay so a changed --ai-url/--ai-api-key takes effect immediately; it never
 touches other agents' relays.
 
-MCP forwarding works the same way but is OPT-IN (unlike the always-on LLM
-relay): pass --mcp-url to allocate this agent an `mcp_port`, open its own
-10.0.2.102 pinhole, start host/mcp-relay.mjs (that agent's own process/port),
-and push a guest-side ~/.pi/agent/mcp.json pointing at the local pinhole —
-pi-mcp-adapter (installed in the base image) reads that file to register MCP
-tools. The real --mcp-url and OAuth credentials never reach the guest; the
-relay injects the real Authorization header server-side, same pattern as the
-LLM relay. Omit --mcp-url and none of this happens for that launch.
+MCP forwarding works the same way as the LLM relay: every launch allocates
+this agent an `mcp_port`, opens its own 10.0.2.102 pinhole, starts
+host/mcp-relay.mjs (that agent's own process/port), and pushes a guest-side
+~/.pi/agent/mcp.json pointing at the local pinhole — pi-mcp-adapter
+(installed in the base image) reads that file to register MCP tools. The real
+--mcp-url and OAuth credentials never reach the guest; the relay injects the
+real Authorization header server-side, same pattern as the LLM relay.
 
 Unlike the LLM relay's static API key, the MCP relay authenticates upstream
 with per-USER OAuth (per the MCP authorization spec): before launching, this
@@ -101,6 +100,7 @@ done
 
 [ -n "$NAME" ] || { echo "Error: --name is required." >&2; usage >&2; exit 1; }
 [ -n "$REPO" ] || { echo "Error: --repo is required." >&2; usage >&2; exit 1; }
+[ -n "$MCP_URL" ] || { echo "Error: --mcp-url is required." >&2; usage >&2; exit 1; }
 case "$NAME" in
   *[!a-zA-Z0-9_-]*) echo "Error: --name must be alphanumeric, dash, underscore." >&2; exit 1 ;;
 esac
@@ -117,37 +117,36 @@ command -v gh >/dev/null || { echo "Error: gh CLI not found (brew install gh)." 
 AGENT_DIR="$ROOT/agents/$NAME"
 WORKSPACE="$AGENT_DIR/shared"
 REPO_NAME="${REPO##*/}"
-REPO_DIR="$WORKSPACE/$REPO_NAME"
+INPUT_TAR="$WORKSPACE/input.tar"
 mkdir -p "$WORKSPACE"
 
 [ -n "$GH_TOKEN_FLAG" ] && export GH_TOKEN="$GH_TOKEN_FLAG"
 
-if [ -d "$REPO_DIR/.git" ]; then
-  echo "Repo already cloned at $REPO_DIR — pulling latest."
-  git -C "$REPO_DIR" pull --ff-only || {
-    echo "Error: could not fast-forward existing clone at $REPO_DIR. Resolve manually or remove it." >&2
-    exit 1
-  }
-elif [ -e "$REPO_DIR" ]; then
-  echo "Error: $REPO_DIR exists but is not a git repo. Remove it and retry." >&2
-  exit 1
+# Clone to a host temp dir and hand the repo to the guest as a single
+# input.tar in the shared folder. Extracting one large sequential file over
+# 9p is fast; a raw clone tree there forces per-file 9p round-trips when the
+# guest copies it to its local workspace (observed cp -r timeouts).
+CLONE_TMP="$(mktemp -d)"
+trap 'rm -rf "$CLONE_TMP"' EXIT
+REPO_DIR="$CLONE_TMP/$REPO_NAME"
+if [ -n "$BRANCH" ]; then
+  gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
 else
-  if [ -n "$BRANCH" ]; then
-    gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
-  else
-    gh repo clone "$REPO" "$REPO_DIR"
-  fi
+  gh repo clone "$REPO" "$REPO_DIR"
 fi
+tar --no-xattrs --no-mac-metadata -cf "$INPUT_TAR" -C "$CLONE_TMP" "$REPO_NAME"
+rm -rf "$CLONE_TMP"
+trap - EXIT
+echo "Wrote $INPUT_TAR ($(du -h "$INPUT_TAR" | cut -f1 | tr -d ' ')) — extracts to $REPO_NAME/."
 
 cd "$ROOT"
 RAM_ARGS=()
 [ -n "$RAM" ] && RAM_ARGS=(--ram "$RAM")
-MCP_CREATE_ARGS=()
-[ -n "$MCP_URL" ] && MCP_CREATE_ARGS=(--mcp)
+MCP_CREATE_ARGS=(--mcp)
 # ${arr[@]+...} guards against `set -u` + empty array on macOS bash 3.2.
 
 # Ensure the agent exists (allocating its own ssh_port/app_port/vnc_port AND
-# relay_port, plus mcp_port when --mcp-url was given) before writing .env /
+# relay_port and mcp_port) before writing .env /
 # starting relays below — those need this agent's relay_port/mcp_port, which
 # only exist once agent.json does. --no-start defers the actual VM boot to
 # the `up` call at the end, after the relays are ready to receive guest
@@ -161,20 +160,12 @@ fi
 RELAY_PORT=$(sed -n 's/.*"relay_port": *\([0-9]*\).*/\1/p' "$AGENT_DIR/agent.json")
 [ -n "$RELAY_PORT" ] || { echo "Error: could not read relay_port from $AGENT_DIR/agent.json" >&2; exit 1; }
 
-MCP_PORT=""
-if [ -n "$MCP_URL" ]; then
-  MCP_PORT=$(sed -n 's/.*"mcp_port": *\([0-9]*\).*/\1/p' "$AGENT_DIR/agent.json")
-  if [ -z "$MCP_PORT" ]; then
-    # Agent existed already but was never opted into MCP (created before
-    # --mcp-url support, or a prior launch of it omitted --mcp-url). mcp_port
-    # is only allocated at `create` time, so retrofitting it here would need
-    # to mutate an existing agent.json — not something this script does
-    # automatically. Fail loudly instead of silently skipping MCP.
-    echo "Error: agent '$NAME' has no persisted mcp_port (it was created without --mcp-url)." >&2
-    echo "  Destroy and recreate it with --mcp-url, or start it manually with:" >&2
-    echo "  ./open-computer up $NAME --mcp-port <port>" >&2
-    exit 1
-  fi
+MCP_PORT=$(sed -n 's/.*"mcp_port": *\([0-9]*\).*/\1/p' "$AGENT_DIR/agent.json")
+if [ -z "$MCP_PORT" ]; then
+  echo "Error: agent '$NAME' has no persisted mcp_port (it was created without MCP)." >&2
+  echo "  Destroy and recreate it, or start it manually with:" >&2
+  echo "  ./open-computer up $NAME --mcp-port <port>" >&2
+  exit 1
 fi
 
 # The guest always talks to THIS agent's own host relay on localhost, never
@@ -227,10 +218,8 @@ RELAY_PORT="$RELAY_PORT" UPSTREAM_BASE_URL="$AI_URL" UPSTREAM_API_KEY="$AI_API_K
 echo $! > "$RELAY_PIDFILE"
 echo "Started LLM relay for '$NAME' on 127.0.0.1:$RELAY_PORT -> ${AI_URL:-<unconfigured>} (pid $(cat "$RELAY_PIDFILE"), log $RELAY_LOG)."
 
-# MCP relay: opt-in (only when --mcp-url was given), otherwise skipped
-# entirely — no relay, no pinhole traffic, no guest config touched. Same
-# restart-on-every-launch policy as the LLM relay above. Two distinct
-# credential boundaries:
+# MCP relay: one process per agent, same restart-on-every-launch policy as the
+# LLM relay above. Two distinct credential boundaries:
 #   1. relay -> upstream: per-user OAuth. host/mcp-oauth.mjs runs first —
 #      silent when the host token cache already has a usable token for
 #      (current OS user, this server's authorization server), a browser
@@ -243,33 +232,31 @@ echo "Started LLM relay for '$NAME' on 127.0.0.1:$RELAY_PORT -> ${AI_URL:-<uncon
 #      (inside ~/.pi/agent/mcp.json, below). The relay 401s anything that
 #      doesn't present it, so a restarted VM needs a re-launch (which mints
 #      a new secret) — that's intentional pairing, not a bug.
-if [ -n "$MCP_URL" ]; then
-  echo "Checking MCP OAuth login for $MCP_URL (browser opens only if needed)..."
-  MCP_TOKEN_CACHE_FILE="$(node "$HERE/mcp-oauth.mjs" login --mcp-url "$MCP_URL")"
-  [ -n "$MCP_TOKEN_CACHE_FILE" ] || { echo "Error: MCP OAuth login failed for $MCP_URL." >&2; exit 1; }
+echo "Checking MCP OAuth login for $MCP_URL (browser opens only if needed)..."
+MCP_TOKEN_CACHE_FILE="$(node "$HERE/mcp-oauth.mjs" login --mcp-url "$MCP_URL")"
+[ -n "$MCP_TOKEN_CACHE_FILE" ] || { echo "Error: MCP OAuth login failed for $MCP_URL." >&2; exit 1; }
 
-  MCP_RELAY_PIDFILE="$AGENT_DIR/mcp-relay.pid"
-  MCP_RELAY_LOG="$AGENT_DIR/mcp-relay.log"
-  if [ -f "$MCP_RELAY_PIDFILE" ] && kill -0 "$(cat "$MCP_RELAY_PIDFILE")" 2>/dev/null; then
-    echo "Restarting MCP relay for '$NAME' (pid $(cat "$MCP_RELAY_PIDFILE"))..."
-    kill "$(cat "$MCP_RELAY_PIDFILE")" 2>/dev/null || true
-    rm -f "$MCP_RELAY_PIDFILE"
-  fi
-  MCP_GUEST_SECRET="$(openssl rand -hex 32)"
-  MCP_RELAY_PORT="$MCP_PORT" UPSTREAM_MCP_URL="$MCP_URL" \
-    MCP_GUEST_SECRET="$MCP_GUEST_SECRET" \
-    MCP_TOKEN_CACHE_FILE="$MCP_TOKEN_CACHE_FILE" \
-    nohup node "$HERE/mcp-relay.mjs" >> "$MCP_RELAY_LOG" 2>&1 &
-  echo $! > "$MCP_RELAY_PIDFILE"
-  echo "Started MCP relay for '$NAME' on 127.0.0.1:$MCP_PORT -> $MCP_URL (pid $(cat "$MCP_RELAY_PIDFILE"), log $MCP_RELAY_LOG)."
-  echo "  Upstream auth: per-user OAuth tokens from $MCP_TOKEN_CACHE_FILE. Guest auth: per-launch shared secret (env-only, never written to disk)."
+MCP_RELAY_PIDFILE="$AGENT_DIR/mcp-relay.pid"
+MCP_RELAY_LOG="$AGENT_DIR/mcp-relay.log"
+if [ -f "$MCP_RELAY_PIDFILE" ] && kill -0 "$(cat "$MCP_RELAY_PIDFILE")" 2>/dev/null; then
+  echo "Restarting MCP relay for '$NAME' (pid $(cat "$MCP_RELAY_PIDFILE"))..."
+  kill "$(cat "$MCP_RELAY_PIDFILE")" 2>/dev/null || true
+  rm -f "$MCP_RELAY_PIDFILE"
 fi
+MCP_GUEST_SECRET="$(openssl rand -hex 32)"
+MCP_RELAY_PORT="$MCP_PORT" UPSTREAM_MCP_URL="$MCP_URL" \
+  MCP_GUEST_SECRET="$MCP_GUEST_SECRET" \
+  MCP_TOKEN_CACHE_FILE="$MCP_TOKEN_CACHE_FILE" \
+  nohup node "$HERE/mcp-relay.mjs" >> "$MCP_RELAY_LOG" 2>&1 &
+echo $! > "$MCP_RELAY_PIDFILE"
+echo "Started MCP relay for '$NAME' on 127.0.0.1:$MCP_PORT -> $MCP_URL (pid $(cat "$MCP_RELAY_PIDFILE"), log $MCP_RELAY_LOG)."
+echo "  Upstream auth: per-user OAuth tokens from $MCP_TOKEN_CACHE_FILE. Guest auth: per-launch shared secret (env-only, never written to disk)."
 
 # Dev mode: 9p-mounts the live services/ tree so the VM runs this fork's
 # service code instead of the stale bundle baked into the prebuilt base image.
 # agent.json (and its relay_port) already exists by this point, so `up`
 # always picks up this agent's own relay through the LLM pinhole.
-./open-computer up "$NAME" --dev ${RAM_ARGS[@]+"${RAM_ARGS[@]}"}
+./open-computer up "$NAME" ${RAM_ARGS[@]+"${RAM_ARGS[@]}"}
 
 SSH_PORT=$(sed -n 's/.*"ssh_port": *\([0-9]*\).*/\1/p' "$AGENT_DIR/agent.json")
 APP_PORT=$(sed -n 's/.*"app_port": *\([0-9]*\).*/\1/p' "$AGENT_DIR/agent.json")
@@ -313,6 +300,11 @@ fi
 sudo mkdir -p /home/agent/workspace
 sudo chown agent:agent /home/agent/workspace
 echo "Guest shared mount ensured (/home/agent/shared) and local workspace dir created."
+# Extract the task repo host-pushed as input.tar into the guest's local
+# workspace now, before any task prompt reaches the agent, so the agent never
+# has to touch the slow 9p share for input.
+tar --warning=no-unknown-keyword -xf /home/agent/shared/input.tar -C /home/agent/workspace
+echo "Extracted /home/agent/shared/input.tar into /home/agent/workspace."
 GUEST
 
 # Guest-side MCP config: pi-mcp-adapter (installed by provisioning) reads
@@ -324,9 +316,8 @@ GUEST
 # the guest; the real --mcp-url and OAuth credentials stay host-side. The
 # secret travels over the SSH control channel (stdin), never through the 9p
 # share or any other host<->guest file handoff.
-if [ -n "$MCP_URL" ]; then
-  echo "Pushing MCP config for '$NAME' (pointing at local relay pinhole)..."
-  MCP_GUEST_CONFIG=$(cat <<EOF
+echo "Pushing MCP config for '$NAME' (pointing at local relay pinhole)..."
+MCP_GUEST_CONFIG=$(cat <<EOF
 {
   "mcpServers": {
     "gateway": {
@@ -338,9 +329,8 @@ if [ -n "$MCP_URL" ]; then
 }
 EOF
 )
-  ssh "${SSH_OPTS[@]}" agent@localhost 'umask 077 && mkdir -p ~/.pi/agent && cat > ~/.pi/agent/mcp.json' <<< "$MCP_GUEST_CONFIG"
-  echo "Guest MCP config written (~/.pi/agent/mcp.json, mode 600)."
-fi
+ssh "${SSH_OPTS[@]}" agent@localhost 'umask 077 && mkdir -p ~/.pi/agent && cat > ~/.pi/agent/mcp.json' <<< "$MCP_GUEST_CONFIG"
+echo "Guest MCP config written (~/.pi/agent/mcp.json, mode 600)."
 
 echo ""
 echo "=== Agent '$NAME' is up ==="
@@ -348,11 +338,9 @@ echo "  UI:         http://localhost:$APP_PORT"
 echo "  Shared:     $WORKSPACE (mounted in guest at /home/agent/shared)"
 echo "  SSH:        ssh -p $SSH_PORT agent@localhost"
 echo "  LLM relay:  127.0.0.1:$RELAY_PORT -> ${AI_URL:-<unconfigured>} (this agent only)"
-if [ -n "$MCP_URL" ]; then
-  echo "  MCP relay:  127.0.0.1:$MCP_PORT -> $MCP_URL (this agent only)"
-fi
+echo "  MCP relay:  127.0.0.1:$MCP_PORT -> $MCP_URL (this agent only)"
 echo ""
 echo "To stop:"
-echo "  ./open-computer down $NAME      # also stops this agent's LLM relay (and MCP relay, if any)"
-echo "  ./open-computer destroy $NAME   # deletes the agent; also stops its LLM relay (and MCP relay, if any)"
+echo "  ./open-computer down $NAME      # also stops this agent's LLM relay and MCP relay"
+echo "  ./open-computer destroy $NAME   # deletes the agent; also stops its LLM relay and MCP relay"
 echo "  kill \$(cat $PROXY_PIDFILE) && rm -f $PROXY_PIDFILE   # whitelist proxy (shared across all agents)"

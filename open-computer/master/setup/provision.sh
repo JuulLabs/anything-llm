@@ -182,14 +182,13 @@ cat > "$PI_AGENT_DIR/hermes-memory-config.json" <<'EOF'
 EOF
 chown -R "$REAL_USER:$REAL_USER" "$PI_AGENT_DIR"
 
-# ---------- pi-mcp-adapter (MCP tool access, opt-in per agent) ----------
+# ---------- pi-mcp-adapter (MCP tool access) ----------
 # Registers MCP servers listed in Pi's mcp.json-style config as native Pi
 # tools. We ship an EMPTY placeholder here (no servers) — exactly like the
 # per-agent .env is not baked into the image — because the real server entry
 # (pointing at THIS agent's own host MCP relay pinhole, never the real
 # upstream URL/token) is written per-agent by host/launch-task.sh at launch
-# time, only when --mcp-url is given. Agents that never pass --mcp-url see
-# only this empty config and pi-mcp-adapter simply has nothing to connect to.
+# time. launch-task.sh requires --mcp-url and always pushes guest MCP config.
 log "Installing pi-mcp-adapter extension"
 su - "$REAL_USER" -c "pi install npm:pi-mcp-adapter"
 

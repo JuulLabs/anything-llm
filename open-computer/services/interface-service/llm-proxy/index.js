@@ -1,7 +1,6 @@
 const {
   settings,
   LLM_PROXY_DEFAULT_MAX_TOKENS,
-  LLM_PROXY_STREAM_MAX_BYTES,
 } = require("../config");
 const { broadcast } = require("../broadcast");
 const { getPendingInterrupt, clearPendingInterrupt, setPendingInterrupt } = require("../interrupt");
@@ -24,21 +23,22 @@ function getLlmRequestStatus() {
 // We accumulate the actual LLM text content from SSE delta frames into a
 // rolling buffer and periodically check whether the agent is generating the
 // same structural lines over and over (e.g. hundreds of ax.annotate() calls).
-// If repetition is found we halt the stream early and inject a guidance
-// interrupt so the agent writes to a file instead.
+// Detection is advisory-only: the stream is always delivered in full, and a
+// guidance interrupt is queued for after completion so the agent writes to a
+// file instead.
 
 const REPETITION_TEXT_BUF = 6000;   // chars of LLM text to keep
 const REPETITION_CHECK_EVERY = 20 * 1024; // bytes streamed between checks
 const REPETITION_MIN_LINES = 8;     // minimum lines before we bother checking
-const REPETITION_LINE_PREFIX = 50;  // chars used as a line fingerprint
-const REPETITION_LINE_HITS = 4;     // same prefix this many times → repetitive
+const REPETITION_LINE_PREFIX = 120; // cap on line key length
+const REPETITION_LINE_HITS = 12;    // same line this many times → repetitive
 
 function _isRepetitive(text) {
   const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 15);
   if (lines.length < REPETITION_MIN_LINES) return false;
   const counts = {};
   for (const l of lines) {
-    const key = l.slice(0, REPETITION_LINE_PREFIX);
+    const key = l.length > REPETITION_LINE_PREFIX ? l.slice(0, REPETITION_LINE_PREFIX) : l;
     counts[key] = (counts[key] || 0) + 1;
     if (counts[key] >= REPETITION_LINE_HITS) return true;
   }
@@ -303,13 +303,11 @@ function registerLlmProxy(app) {
         const reader = upstream.body.getReader();
         const decoder = new TextDecoder();
         let totalBytes = 0;
-        let aborted = false;
-        let abortReason = "";
+        let repetitionDetected = false;
         let streamUsage = null;
         let sseLineBuffer = "";
         let llmTextBuf = "";          // rolling window of actual LLM text content
         let nextRepetitionCheck = REPETITION_CHECK_EVERY;
-        let nextSizeCheck = LLM_PROXY_STREAM_MAX_BYTES; // soft size gate; extends if content looks clean
 
         try {
           while (true) {
@@ -338,35 +336,16 @@ function registerLlmProxy(app) {
               }
             }
 
-            // Early repetition check — catches obvious loops well before the size gate.
-            if (totalBytes >= nextRepetitionCheck) {
+            // Advisory repetition check — never aborts the stream.
+            if (!repetitionDetected && totalBytes >= nextRepetitionCheck) {
               nextRepetitionCheck += REPETITION_CHECK_EVERY;
               if (_isRepetitive(llmTextBuf)) {
-                res.write(chunk);
-                res.write("\ndata: [DONE]\n\n");
-                aborted = true;
-                abortReason = "repetition";
-                try { reader.cancel(); } catch {}
-                break;
+                repetitionDetected = true;
+                broadcast({
+                  type: "agent_log",
+                  content: `[llm-proxy] ⚠ Repetitive output detected at ${Math.round(totalBytes / 1024)}KB — letting stream finish, guidance queued`,
+                });
               }
-            }
-
-            // Size gate — check for repetition before deciding to abort or extend.
-            if (totalBytes >= nextSizeCheck) {
-              if (_isRepetitive(llmTextBuf)) {
-                res.write(chunk);
-                res.write("\ndata: [DONE]\n\n");
-                aborted = true;
-                abortReason = "repetition";
-                try { reader.cancel(); } catch {}
-                break;
-              }
-              // Content looks non-repetitive — let it run for another window.
-              broadcast({
-                type: "agent_log",
-                content: `[llm-proxy] Stream at ${Math.round(totalBytes / 1024)}KB — content looks non-repetitive, extending by ${Math.round(LLM_PROXY_STREAM_MAX_BYTES / 1024)}KB`,
-              });
-              nextSizeCheck += LLM_PROXY_STREAM_MAX_BYTES;
             }
 
             res.write(chunk);
@@ -380,18 +359,12 @@ function registerLlmProxy(app) {
             } catch {}
           }
         } catch (streamErr) {
-          if (!aborted) {
-            const classified = classifyLlmError(streamErr.message);
-            broadcastLlmError(classified, streamErr.message);
-          }
+          const classified = classifyLlmError(streamErr.message);
+          broadcastLlmError(classified, streamErr.message);
         } finally {
           res.end();
           _accumulateUsage(streamUsage);
-          if (aborted) {
-            broadcast({
-              type: "agent_log",
-              content: `[llm-proxy] ⚠ Repetitive output detected at ${Math.round(totalBytes / 1024)}KB — halting and injecting guidance`,
-            });
+          if (repetitionDetected) {
             setPendingInterrupt(
               "You are repeating the same lines over and over in your response. Stop. " +
               "Write your output directly to a file using the write or bash tool instead of outputting it inline. Keep your reply text short."

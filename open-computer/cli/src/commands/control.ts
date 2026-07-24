@@ -167,7 +167,13 @@ export function execUpCommand(name: string, opts: UpOptions = {}): boolean {
     vncDisplay: vnc_display, dev, gui, llmPort, mcpPort, workspace, ram,
   });
 
-  if (ok && dev && PLATFORM === 'win32' && GUEST_ARCH === 'x86_64') {
+  // The base image ships only an empty /opt/open-computer mount point; the
+  // services tree reaches the guest either via the dev 9p mount or, when not
+  // in dev mode (or on Windows x64, where the 9p share is unavailable), via a
+  // one-shot SCP sync at boot. The synced copy is static for the VM's
+  // lifetime, so host-side edits cannot restart the service mid-run.
+  const needsServiceSync = !dev || (PLATFORM === 'win32' && GUEST_ARCH === 'x86_64');
+  if (ok && needsServiceSync) {
     const ready = waitForSsh(ssh_port, VM_USER, 60, 3);
     if (ready) {
       syncServiceToVm(ssh_port);
